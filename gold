@@ -2,26 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-Zirve — S/R (0.70% + 1. mum kapalı + 2. mum CANLI) + Vol & Corr + HTF Trend GATE (5h)
---------------------------------------------------------------------------------------
-• Sinyal mantığı:
-   1) Pivot (swing)
-   2) Pivot sonrası i+1..i+2/3 aralığında extremumla ≥ %0.70 ters hareket
-   3) i+1 barı ters yöne KAPANIŞ (zorunlu)
-   4) i+2 barı CANLI (zorunlu) ve ters yönü sürdürmeli
-   5) Sinyal anı: last - i == 2  (tam 2. mum canlı)
-
-• Filtreler:
-   - Volatilite skoru (0..1)  → GUI “Vol ≥” (default 0.50)
-   - BTC korelasyonu |corr|   → GUI “|Corr| ≤” (default 0.70)
-   - Trend Mode (GUI):
-        • 5h Structure (HH/HL): Son 5 saat 1H mumlarda HH&HL → UP, LH&LL → DOWN, aksi → SIDE
-        • 24h Change %        : 24×1h kapanış değişimine göre UP/DOWN/SIDE
-
-• Telegram opsiyonel.
+META — STRICT S/R + Rejim/Skor + Debug & Stats + SIDE Trendde 2. Dokunuş + 1 Mum Ters Yön
+- Bu sürüm: her reddedilen aday için nedenleri loglar ve
+  tarama sırasında/sonunda filtre istatistikleri üretir.
+- GUI: Verbose Debug ve Enable Stats seçenekleri eklendi.
+- YENİ (istek): Trend SIDE iken yalnızca
+    * önceden 1 dokunuş yapılmış,
+    * şu anda 2. dokunuş gerçekleşmiş ve
+    * hemen sonraki bar 1 mum ters yönde gitmiş
+  coinler kabul edilir.
 """
 
-import os, sys, time, threading, warnings, subprocess, webbrowser
+import os, sys, time, threading, warnings, subprocess, io, math, collections
 warnings.filterwarnings("ignore")
 
 import ccxt
@@ -34,41 +26,61 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from ccxt.base.errors import DDoSProtection, RateLimitExceeded, NetworkError
 import requests
+from PIL import Image
 
-# =============== (Opsiyonel) Telegram ===============
-TG_TOKEN   = os.getenv("TG_TOKEN", "8080474574:AAGDLzJzWgU15Fr_SSeuRQPSaon1Fu4gHjc")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "1449828433")
+# =========================
+# Telegram (ENV tabanlı)
+# =========================
+TG_TOKEN   = (os.getenv("TG_TOKEN")   or "").strip()
+TG_CHAT_ID = (os.getenv("TG_CHAT_ID") or "").strip()
 
-def send_telegram_alert(text: str):
+def tg_enabled() -> bool:
+    return bool(TG_TOKEN) and bool(TG_CHAT_ID)
+
+def send_telegram_message(text: str) -> bool:
+    if not (tg_enabled() and text): return False
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             data={"chat_id": TG_CHAT_ID, "text": text},
             timeout=6
         )
+        return bool(r.ok)
     except Exception:
-        pass
+        return False
 
-# ====================== Helpers ======================
+def send_telegram_photo(caption: str, photo_path: str) -> bool:
+    if not (tg_enabled() and photo_path and os.path.exists(photo_path)): return False
+    try:
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": TG_CHAT_ID, "caption": caption}
+            r = requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+                data=data, files=files, timeout=12
+            )
+            return bool(r.ok)
+    except Exception:
+        return False
 
+# =========================
+# Helpers / IO
+# =========================
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
-
 def open_path(path: str):
     try:
-        if sys.platform.startswith("win"): os.startfile(path)
+        if sys.platform.startswith("win"): os.startfile(path)  # type: ignore
         elif sys.platform == "darwin": subprocess.Popen(["open", path])
         else: subprocess.Popen(["xdg-open", path])
-    except Exception:
-        pass
+    except Exception: pass
 
 def bar_count_from_hours(tf: str, hours: int) -> int:
-    m = {"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"2h":120,"4h":240}.get(tf,5)
+    m = {"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60}.get(tf,5)
     return max(1, int(hours*60/m))
 
 def _get(v, key, default):
     try: return v.get(key, default)
     except: return default
-
 def _parse_int(v, key, default):
     s = str(_get(v, key, default)).strip()
     if s == "": return int(default)
@@ -76,15 +88,30 @@ def _parse_int(v, key, default):
     except:
         try: return int(float(s.replace(",", ".")))
         except: return int(default)
-
 def _parse_float(v, key, default):
     s = str(_get(v, key, default)).strip()
     if s == "": return float(default)
     try: return float(s.replace(",", "."))
     except: return float(default)
+def read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+def scale_image_bytes(png_bytes: bytes, scale: float) -> bytes:
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    w, h = img.size
+    w2 = max(1, int(w * scale)); h2 = max(1, int(h * scale))
+    img2 = img.resize((w2, h2), Image.LANCZOS)
+    out = io.BytesIO(); img2.save(out, format="PNG"); return out.getvalue()
+def fit_to_window_bytes(png_bytes: bytes, max_w: int, max_h: int, padding: int = 16) -> bytes:
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    W, H = max(1, max_w - padding), max(1, max_h - padding)
+    w, h = img.size
+    scale = max(min(W / w, H / h), 0.05)
+    return scale_image_bytes(png_bytes, scale)
 
-# ====================== CCXT / Binance ======================
-
+# =========================
+# CCXT / Binance
+# =========================
 def load_exchange():
     return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
 
@@ -113,7 +140,16 @@ def to_df(ohlcv):
     df.set_index("time", inplace=True)
     return df
 
-# ====================== Vol & Corr ======================
+# =========================
+# Metrics (ATR, Vol, Corr)
+# =========================
+def _atr_series(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    hlc = df[["high","low","close"]].astype(float)
+    h, l, c = hlc["high"], hlc["low"], hlc["close"]
+    prev_c = c.shift(1)
+    tr = np.maximum(h - l, np.maximum((h - prev_c).abs(), (l - prev_c).abs()))
+    atr = tr.rolling(n, min_periods=max(2, n//2)).mean()
+    return atr
 
 BTC_CACHE = {}
 def get_btc_df_cached(ex, tf, limit, drop_last=True, source="perp"):
@@ -125,309 +161,600 @@ def get_btc_df_cached(ex, tf, limit, drop_last=True, source="perp"):
     BTC_CACHE[key]=df
     return df
 
-def normalize_vol_0_1(vol_raw: float, soft_cap: float = 0.012):
-    # 0..1 normalize (yaklaşık %1.2 günlük std ölçeği varsayımı)
-    return float(np.clip(vol_raw / soft_cap, 0.0, 1.0))
-
-def compute_vol_score(df: pd.DataFrame, vol_bars: int) -> float:
-    if len(df) < vol_bars+2: return 0.0
-    r=df["close"].pct_change()
-    return normalize_vol_0_1(float(r.tail(vol_bars).std()))
+def compute_vol_score_atr(df: pd.DataFrame, n: int = 14, soft_cap: float = 0.012) -> float:
+    if len(df) < n + 3: return 0.0
+    atr = _atr_series(df, n).iloc[-2]
+    close = float(df["close"].iloc[-2])
+    if close <= 0 or np.isnan(atr): return 0.0
+    raw = float(atr) / close
+    return float(np.clip(raw / soft_cap, 0.0, 1.0))
 
 def compute_corr_with_btc(df_sym, btc_df, corr_bars: int) -> float:
-    df = pd.merge(df_sym[["close"]].reset_index(),
-                  btc_df[["close"]].reset_index().rename(columns={"close":"close_btc"}),
-                  on="time", how="inner").set_index("time")
-    if len(df)<corr_bars+5: return 0.0
-    sr=np.log(df["close"]).diff(); br=np.log(df["close_btc"]).diff()
-    c=float(pd.concat([sr.tail(corr_bars), br.tail(corr_bars)], axis=1).corr().iloc[0,1])
+    df = pd.merge(
+        df_sym[["close"]].reset_index(),
+        btc_df[["close"]].reset_index().rename(columns={"close":"close_btc"}),
+        on="time", how="inner"
+    ).set_index("time")
+    if len(df) < corr_bars + 5: return 0.0
+    sr = np.log(df["close"]).diff()
+    br = np.log(df["close_btc"]).diff()
+    pair = pd.concat([sr.tail(corr_bars), br.tail(corr_bars)], axis=1).dropna()
+    if len(pair) < max(10, corr_bars//3): return 0.0
+    c = float(pair.corr().iloc[0,1])
     return 0.0 if np.isnan(c) else c
 
-# ====================== Pivot (Swing) ======================
-
+# =========================
+# Pivots / Momentum
+# =========================
 def is_swing_high(df,i,left,right):
     lo=max(0,i-left); hi=min(len(df),i+right+1)
     return df["high"].iloc[i] == df["high"].iloc[lo:hi].max()
-
 def is_swing_low(df,i,left,right):
     lo=max(0,i-left); hi=min(len(df),i+right+1)
     return df["low"].iloc[i] == df["low"].iloc[lo:hi].min()
 
-# === Momentum (0.70% + 1. mum kapalı + 2. mum CANLI) ===
-def momentum_reversal_ok_live2(df: pd.DataFrame, i: int, direction: str, min_move: float = 0.007) -> bool:
+def _min_move_threshold(df: pd.DataFrame, idx: int, pct_floor: float = 0.007, atr_mult: float = 0.35) -> float:
+    if idx <= 1 or len(df) < 20: return pct_floor
+    atr = _atr_series(df, 14).iloc[idx-1]
+    close = float(df["close"].iloc[idx-1])
+    if close <= 0 or np.isnan(atr): return pct_floor
+    return max(pct_floor, float(atr) / close * atr_mult)
+
+def momentum_reversal_ok_live2(df: pd.DataFrame, i: int, direction: str) -> bool:
     last = len(df) - 1
-    if i + 1 > last - 1:  # 1. mum kapanmış olmalı
+    if i + 1 > last - 1:
         return False
-    if last - i != 2:     # tam an: 2. mum canlı
+    if last - i != 2:
         return False
     end_idx = min(i + 2, last)
+    min_move = _min_move_threshold(df, i+2)
 
-    if direction == "RES":  # tepeden düşüş
+    if direction == "RES":
         level = float(df["high"].iloc[i])
         min_low = float(df["low"].iloc[i+1:end_idx+1].min())
         move = (level - min_low) / max(1e-9, level)
-        if move < min_move:
-            return False
-        if not (df["close"].iloc[i+1] < df["close"].iloc[i]):
-            return False
+        if move < min_move: return False
+        if not (df["close"].iloc[i+1] < df["close"].iloc[i]): return False
         return df["close"].iloc[i+2] < df["close"].iloc[i+1]
-    else:  # SUP — dipten yükseliş
+    else:
         level = float(df["low"].iloc[i])
         max_high = float(df["high"].iloc[i+1:end_idx+1].max())
         move = (max_high - level) / max(1e-9, level)
-        if move < min_move:
-            return False
-        if not (df["close"].iloc[i+1] > df["close"].iloc[i]):
-            return False
+        if move < min_move: return False
+        if not (df["close"].iloc[i+1] > df["close"].iloc[i]): return False
         return df["close"].iloc[i+2] > df["close"].iloc[i+1]
 
-# ====================== Seviye Tespiti (yalnızca 2. mum canlı) ======================
-
-def cluster_levels(levels, tol_pct=0.5):
+# =========================
+# Level tespiti & TTL & Cluster
+# =========================
+def cluster_levels_atr(levels, df: pd.DataFrame, tol_atr_mult=0.5, atr_n=14):
     if not levels: return []
-    levels=sorted(levels,key=lambda x:x["price"])
+    atr = _atr_series(df, atr_n).iloc[-2]
+    if np.isnan(atr) or atr <= 0:
+        tol = float(df["close"].iloc[-2]) * 0.01
+    else:
+        tol = float(atr) * float(tol_atr_mult)
+
+    levels = sorted(levels, key=lambda x: x["price"])
     out=[]; cur=None
     for lv in levels:
         if cur is None:
-            cur={**lv,"members":[lv]}
-        elif abs(lv["price"]-cur["price"])/max(1e-9,cur["price"])<=tol_pct/100.0:
-            cur["price"]=(cur["price"]*len(cur["members"])+lv["price"])/(len(cur["members"])+1)
-            cur["members"].append(lv)
+            cur = {**lv}
         else:
-            out.append(dict(price=float(cur["price"]), side=cur["side"], index=max(m["index"] for m in cur["members"])))
-            cur={**lv,"members":[lv]}
+            if abs(lv["price"] - cur["price"]) <= tol:
+                cur["price"] = (cur["price"] + lv["price"]) / 2.0
+                cur["index"] = max(cur["index"], lv["index"])
+            else:
+                out.append(dict(price=float(cur["price"]), side=cur["side"], index=cur["index"]))
+                cur = {**lv}
     if cur:
-        out.append(dict(price=float(cur["price"]), side=cur["side"], index=max(m["index"] for m in cur["members"])) )
+        out.append(dict(price=float(cur["price"]), side=cur["side"], index=cur["index"]))
     return out
 
-def detect_levels_minimal(df, tf="5m", swing_period=20, tol_pct=0.5, ttl_h=6):
-    """
-    Sinyali SADECE şu anda üretir:
-      • i = last - 2  → 1. mum kapalı, 2. mum CANLI (zorunlu)
-    """
+def filter_by_ttl_timestamp(levels, df: pd.DataFrame, ttl_hours: int):
+    if not levels or len(df)==0: return []
+    last_ts = df.index[-1]
+    limit_ts = last_ts - pd.Timedelta(hours=int(ttl_hours))
+    return [lv for lv in levels if df.index[lv["index"]] >= limit_ts]
+
+def detect_levels_minimal(df, tf="5m", swing_period=20, tol_atr_mult=0.5, ttl_h=6):
     L=[]; left=right=swing_period//2
     last = len(df)-1
-
     i = last - 2
-    if i < left or i < 0:
-        return []
-
+    if i < left or i < 0: return []
     if is_swing_high(df, i, left, right) and momentum_reversal_ok_live2(df, i, "RES"):
         L.append(dict(price=float(df["high"].iloc[i]), side="RES", index=i))
     if is_swing_low(df, i, left, right) and momentum_reversal_ok_live2(df, i, "SUP"):
         L.append(dict(price=float(df["low"].iloc[i]), side="SUP", index=i))
 
-    L = cluster_levels(L, tol_pct=tol_pct)
-    bars_ttl = bar_count_from_hours(tf, ttl_h)
-    return [lv for lv in L if (last - lv["index"]) <= bars_ttl]
+    L = cluster_levels_atr(L, df, tol_atr_mult=tol_atr_mult, atr_n=14)
+    L = filter_by_ttl_timestamp(L, df, ttl_hours=ttl_h)
+    return L
 
-# ====================== Trend (HTF gate: 5h Structure) ======================
+# =========================
+# TREND: 8h @ 5m
+# =========================
+def trend_change_8h_5m(df_5m: pd.DataFrame, thr: float = 0.01):
+    bars_8h = 8 * 60 // 5
+    need = bars_8h + 2
+    if df_5m is None or len(df_5m) < need:
+        return "SIDE", 0.0
+    closes = df_5m["close"].astype(float)
+    c_now  = closes.iloc[-2]
+    c_prev = closes.iloc[-(bars_8h+2)]
+    if c_prev <= 0: return "SIDE", 0.0
+    pct = (c_now - c_prev) / c_prev
+    if pct >= thr:   return "UP", pct
+    if pct <= -thr:  return "DOWN", pct
+    return "SIDE", pct
 
-def _mark_pivots_1h(fr: pd.DataFrame, left: int = 2, right: int = 2):
-    highs = fr['high'].values
-    lows  = fr['low'].values
-    n = len(fr)
-    pivH = np.zeros(n, dtype=bool)
-    pivL = np.zeros(n, dtype=bool)
-    for i in range(left, n-right):
-        h = highs[i]; l = lows[i]
-        if np.all(h >= highs[i-left:i]) and np.all(h >= highs[i+1:i+1+right]):
-            pivH[i] = True
-        if np.all(l <= lows[i-left:i]) and np.all(l <= lows[i+1:i+1+right]):
-            pivL[i] = True
-    out = fr.copy()
-    out['pivH'] = pivH
-    out['pivL'] = pivL
-    return out
+# =========================
+# EK FİLTRELER / SKORLAR
+# =========================
+def volatility_regime(df, lookback=120, n_atr=14):
+    if len(df) < lookback + n_atr + 5: return "LOW"
+    atr_rel = (_atr_series(df, n_atr) / df["close"].astype(float)).dropna()
+    v = float(atr_rel.iloc[-2])
+    hist = atr_rel.tail(lookback)
+    pct = (hist < v).mean()
+    return "HIGH" if pct >= 0.70 else "MED" if pct >= 0.40 else "LOW"
 
-def htf_trend_struct(df_1h: pd.DataFrame, lookback_hours: int = 5, left: int = 1, right: int = 1, min_swing_pct: float = 0.001) -> str:
+def trend_strength(df, n=14):
+    r = df["close"].astype(float).diff().tail(n)
+    up = r.clip(lower=0).sum()
+    dn = (-r.clip(upper=0)).sum()
+    tot = up + dn
+    if tot == 0: return 0.0
+    return float(abs(up - dn) / tot)
+
+def rel_volume(df, short=20, long=60):
+    if len(df) < long + 2: return 1.0
+    s = df["volume"].astype(float).tail(short).mean()
+    l = df["volume"].astype(float).tail(long).mean()
+    return float(s / max(l, 1e-9))
+
+def wick_quality_ok(df, i, side, min_ratio=0.35):
+    rng = float(df["high"].iloc[i] - df["low"].iloc[i])
+    if rng <= 0: return False
+    c = float(df["close"].iloc[i]); o = float(df["open"].iloc[i])
+    upper = (float(df["high"].iloc[i]) - max(c, o)) / rng
+    lower = (min(c, o) - float(df["low"].iloc[i])) / rng
+    if side == "RES":
+        return upper >= min_ratio
+    else:
+        return lower >= min_ratio
+
+def psych_weight(level, step=0.25, tol=0.0005):
+    x = level / step
+    mod = abs(x - round(x))
+    return 1 if mod <= tol else 0
+
+def tradable_distance_ok(px_now, level, min_bps=3.0):
+    dist_bps = abs(level - px_now) / max(px_now,1e-9) * 1e4
+    return dist_bps >= float(min_bps)
+
+def touch_count(df, lvl, tol, lookback=300):
+    seg = df.tail(lookback)
+    lows = seg["low"].values
+    highs = seg["high"].values
+    hits = ((lows <= lvl+tol) & (lows >= lvl-tol)) | ((highs <= lvl+tol) & (highs >= lvl-tol))
+    count=0; prev=False
+    for v in hits:
+        if v and not prev: count+=1
+        prev=v
+    return int(count)
+
+# ---------- YENİ: SIDE Trend için 2. dokunuş + 1 mum ters yön doğrulaması ----------
+def _is_touch_bar(df, i, lvl, tol, side):
+    if i < 0 or i >= len(df): return False
+    if side == "RES":
+        return (df["high"].iloc[i] <= lvl + tol) and (df["high"].iloc[i] >= lvl - tol)
+    else:  # SUP
+        return (df["low"].iloc[i] <= lvl + tol) and (df["low"].iloc[i] >= lvl - tol)
+
+def _count_touch_episodes_until(df, lvl, tol, until_idx):
+    # Ayrık (contiguous) dokunuş kümelerini sayar: [0..until_idx] dahil
+    hits = []
+    for i in range(0, until_idx+1):
+        hit = ((df["low"].iloc[i] <= lvl+tol) and (df["low"].iloc[i] >= lvl-tol)) or \
+              ((df["high"].iloc[i] <= lvl+tol) and (df["high"].iloc[i] >= lvl-tol))
+        hits.append(hit)
+    count=0; prev=False
+    for h in hits:
+        if h and not prev: count += 1
+        prev = h
+    return count
+
+def side_second_touch_then_one_bar_opposite(df: pd.DataFrame, level_px: float, side: str, tol_price: float) -> bool:
     """
-    1H veride, son N saat yapısal salınımlara bakarak trend:
-      - HH & HL → UP
-      - LH & LL → DOWN
-      - aksi → SIDE
+    Şartlar:
+    - Son kapanan bar (-2) tam seviyeye dokunma (2. dokunuş küməsi)
+    - Bu barın hemen ardından gelen bar (-1) ters yöne close
+    - Toplam dokunuş kümeleri (son -2 dahil) tam olarak 2 olmalı
     """
-    if len(df_1h) < (left + right + 5):
-        return "SIDE"
-    fr = _mark_pivots_1h(df_1h, left=left, right=right)
+    if len(df) < 10: return False
+    last = len(df) - 1
+    touch_idx = last - 2  # son kapanan bar
+    # -2'de dokunma var mı?
+    if not _is_touch_bar(df, touch_idx, level_px, tol_price, side):
+        return False
+    # -2 dahil dokunuş epizot sayısı tam 2 olmalı
+    episodes = _count_touch_episodes_until(df, level_px, tol_price, touch_idx)
+    if episodes != 2:
+        return False
+    # -1 bar ters yönde mi?
+    c_next = float(df["close"].iloc[last - 1])
+    c_prev = float(df["close"].iloc[last - 2])
+    if side == "RES":
+        return c_next < c_prev
+    else:  # SUP
+        return c_next > c_prev
 
-    end_ts = fr.index[-1]
-    start_ts = end_ts - pd.Timedelta(hours=lookback_hours)
-    window = fr.loc[fr.index >= start_ts]
+def session_bucket(ts_utc_hour: int) -> str:
+    h = int(ts_utc_hour)
+    if 12 <= h < 20: return "OVERLAP"
+    if 8  <= h < 12: return "EU"
+    if 0  <= h < 8:  return "ASIA"
+    return "NIGHT"
 
-    pts = []
-    for ts, row in window.iterrows():
-        if row.get('pivH', False):
-            pts.append((ts, 'H', float(row['high'])))
-        if row.get('pivL', False):
-            pts.append((ts, 'L', float(row['low'])))
-    if not pts:
-        return "SIDE"
-    pts.sort(key=lambda x: x[0])
-
-    # alternans + min swing
-    alt=[]
-    for p in pts:
-        if not alt:
-            alt.append(p)
-        else:
-            if p[1] == alt[-1][1]:
-                prev_price = alt[-1][2]
-                if abs(p[2]-prev_price)/max(1e-9,prev_price) >= min_swing_pct:
-                    alt[-1] = p
-            else:
-                alt.append(p)
-
-    swings = alt[-4:]  # son 4 nokta
-    highs = [(ts, px) for ts, t, px in swings if t=='H']
-    lows  = [(ts, px) for ts, t, px in swings if t=='L']
-    if len(highs) >= 2 and len(lows) >= 2:
-        _, last_H  = highs[-1]; _, prev_H  = highs[-2]
-        _, last_L  = lows[-1];  _, prev_L  = lows[-2]
-        is_HH = last_H > prev_H
-        is_HL = last_L > prev_L
-        is_LH = last_H < prev_H
-        is_LL = last_L < prev_L
-        if is_HH and is_HL:  return "UP"
-        if is_LH and is_LL:  return "DOWN"
-    return "SIDE"
-
-def trend_from_24h(ex, symbol):
-    """Son 24 saatlik (24×1h) kapanışa göre trend: UP/DOWN/SIDE"""
-    try:
-        df = to_df(fetch_ohlcv_with_retry(ex, symbol, "1h", 26))
-        if len(df) < 25:
-            return "SIDE"
-        c_now = float(df["close"].iloc[-1])
-        c_prev = float(df["close"].iloc[-25])
-        pct = (c_now - c_prev) / max(1e-12, c_prev)
-        if pct > 0.01:      return "UP"
-        elif pct < -0.01:   return "DOWN"
-        else:               return "SIDE"
-    except:
-        return "SIDE"
-
-# ====================== Plot ======================
-
+# =========================
+# Plot
+# =========================
 def plot_chart(df, levels, symbol, out_dir="sr_charts", tf="5m", right_offset=50, dpi=160):
     ensure_dir(out_dir)
     fig, ax = plt.subplots(figsize=(12,5), dpi=dpi)
     x=np.arange(len(df)); ax.plot(x, df["close"].values, color="#dddddd", lw=0.9)
-
     for lv in levels:
         i=lv["index"]; y=lv["price"]; side=lv["side"]
         line_color = "orange" if side=="RES" else "cyan"
-        ax.hlines(y, 0, len(df)+right_offset, colors=line_color, linestyles="--", lw=1.3, alpha=0.9)
-        ax.text(len(df)+1, y, f"{y:.6f}", va="center", fontsize=8, color=line_color)
+        ax.hlines(y, 0, len(df)+right_offset, colors=line_color, linestyles="--", lw=1.3, alpha=0.95)
+        ax.text(len(df)+1, y, f"{side}@{y:.6f}", va="center", fontsize=8, color=line_color)
         if i+2 < len(df):
-            if side=="SUP":
-                ax.plot([i+1, i+2], df["close"].iloc[i+1:i+3], color="limegreen", lw=2.2)
-            else:
-                ax.plot([i+1, i+2], df["close"].iloc[i+1:i+3], color="red", lw=2.2)
-
-    ax.set_title(f"{symbol} — 0.70% + 1T kapalı + 2T CANLI [{tf}]")
+            seg = df["close"].iloc[i+1:i+3]
+            ax.plot(range(i+1, i+1+len(seg)), seg.values,
+                    color=("limegreen" if side=="SUP" else "red"), lw=2.2, alpha=0.9)
+    ax.set_title(f"{symbol} — 0.70% + 1T kapalı + 2T CANLI [{tf}] (ATR normalize)")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
     path=os.path.join(out_dir,f"{symbol.replace('/','_')}_{tf}.png")
-    fig.savefig(path); plt.close(fig)
-    return path
+    fig.savefig(path); plt.close(fig); return path
 
-# ====================== Worker ======================
+def plot_price_only(df, symbol, out_dir="sr_charts", tf="5m", dpi=160):
+    ensure_dir(out_dir)
+    fig, ax = plt.subplots(figsize=(12,5), dpi=dpi)
+    x=np.arange(len(df)); ax.plot(x, df["close"].values, color="#dddddd", lw=0.9)
+    ax.set_title(f"{symbol} — (Aktif SUP/RES bulunamadı) [{tf}]")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    path=os.path.join(out_dir,f"{symbol.replace('/','_')}_{tf}_price.png")
+    fig.savefig(path); plt.close(fig); return path
 
+# =========================
+# Scanner Worker (DEBUG + STATS)
+# =========================
 class ScannerWorker(threading.Thread):
     def __init__(self, window: sg.Window, settings: dict):
         super().__init__(daemon=True)
         self.window=window; self.settings=settings
         self.stop_event=threading.Event()
         self.ex=load_exchange()
+        self.cooldown_map = {}  # {(symbol, side): last_ts}
+        # stats structure
+        self.stats = collections.Counter()
+        self.stats_total_scanned = 0
+        self.stats_accepted = 0
 
     def request_stop(self): self.stop_event.set()
-
     def _fetch_df(self, s):
-        return to_df(fetch_ohlcv_with_retry(self.ex, s, self.settings["tf"], self.settings["limit"]))
+        return to_df(fetch_ohlcv_with_retry(self.ex, s, "5m", self.settings["limit"]))
 
+    def _dynamic_corr_params(self, trend_val: str, abs_pct: float):
+        if trend_val in ("UP","DOWN"):
+            if abs_pct >= self.settings["trend_thr"]*2.0:
+                return 24, 0.85
+            return 12, 0.80
+        return 6, 0.70
+
+    def _maybe_adjust_volmin_by_session(self, vol_min_base: float, utc_hour: int) -> float:
+        bucket = session_bucket(utc_hour)
+        if bucket == "OVERLAP": return vol_min_base * 0.9
+        if bucket == "ASIA": return vol_min_base * 1.15
+        return vol_min_base
+
+    def _in_cooldown(self, symbol: str, side: str, now_ts: pd.Timestamp) -> bool:
+        key=(symbol, side)
+        last = self.cooldown_map.get(key)
+        if not last: return False
+        diff_min = (now_ts - last).total_seconds() / 60.0
+        return diff_min < float(self.settings["cooldown_min"])
+
+    def _mark_cooldown(self, symbol: str, side: str, now_ts: pd.Timestamp):
+        self.cooldown_map[(symbol, side)] = now_ts
+
+    # -------------------------
+    # Yeni: aday değerlendirme (returns ok, score, reasons, touch_count, psych)
+    # -------------------------
+    def _evaluate_candidate(self, df5, s, side, use_lv, level_px, px_now, ctx):
+        reasons = []
+        score = 0
+
+        # unpack context
+        regime = ctx["regime"]; abs_pct = ctx["abs_pct"]; thr = ctx["trend_thr"]
+        strength = ctx["strength"]; rv = ctx["rv"]; vol_score = ctx["vol_score"]
+        corr_val = ctx["corr_val"]; utc_hour = ctx["utc_hour"]
+        tol_atr = ctx["tol_atr"]; min_bps = ctx["min_bps"]; wick_ratio = ctx["wick_ratio"]
+        min_touches = ctx["min_touches"]; require_regime = ctx["require_regime"]
+        min_strength = ctx["min_strength"]; min_relvol = ctx["min_relvol"]; min_score = ctx["min_score"]
+        corr_abs_max = ctx["corr_abs_max"]; t_val = ctx["t_val"]
+
+        # DIST
+        if not tradable_distance_ok(px_now, level_px, min_bps=min_bps):
+            reasons.append("DIST_TOO_SMALL")
+            self.stats["DIST_TOO_SMALL"] += 1
+        else:
+            score += 1
+
+        # WICK
+        try:
+            ok_wick = wick_quality_ok(df5.reset_index(), use_lv["index"], side, min_ratio=wick_ratio)
+        except Exception:
+            ok_wick = False
+        if not ok_wick:
+            reasons.append("BAD_WICK")
+            self.stats["BAD_WICK"] += 1
+        else:
+            score += 1
+
+        # TOUCHES (genel)
+        try:
+            atr_now = _atr_series(df5, 14).iloc[-2]
+            tol_price = (float(atr_now) if not np.isnan(atr_now) and atr_now>0 else float(df5["close"].iloc[-2])*0.01) * float(tol_atr)
+        except Exception:
+            tol_price = float(df5["close"].iloc[-2])*0.01*float(tol_atr)
+        tc = touch_count(df5, level_px, tol_price, lookback=300)
+
+        # ---- SIDE moduna özel KURAL ----
+        if t_val == "SIDE":
+            # Tam 2 dokunuş ve 2. dokunuş -2. barda + -1 bar ters yön:
+            if not side_second_touch_then_one_bar_opposite(df5, level_px, side, tol_price):
+                reasons.append("SIDE_2TOUCH_FAIL")
+                self.stats["SIDE_2TOUCH_FAIL"] += 1
+            else:
+                # SIDE koşulu sağlanırsa, touch_count en az 2 zaten olacak
+                score += 1
+        else:
+            # Trend UP/DOWN modunda dokunuş sayısı normal eşiğe göre
+            if tc < min_touches:
+                reasons.append(f"TOUCHES<{min_touches} ({tc})")
+                self.stats["TOUCHES"] += 1
+            else:
+                score += 1
+
+        # REGIME
+        if require_regime and (regime not in {"MED","HIGH"}):
+            reasons.append(f"REGIME_{regime}")
+            self.stats[f"REGIME_{regime}"] += 1
+        else:
+            score += 1
+
+        # STRENGTH
+        if strength < min_strength:
+            reasons.append(f"STRENGTH<{min_strength:.2f} ({strength:.2f})")
+            self.stats["STRENGTH"] += 1
+        else:
+            score += 1
+
+        # RELVOL
+        if rv < min_relvol:
+            reasons.append(f"RELVOL<{min_relvol:.2f} ({rv:.2f})")
+            self.stats["RELVOL"] += 1
+        else:
+            score += 1
+
+        # VOL SCORE
+        if vol_score < ctx["vol_min"]:
+            reasons.append(f"VOL_SCORE<{ctx['vol_min']:.2f} ({vol_score:.2f})")
+            self.stats["VOL_SCORE"] += 1
+        else:
+            score += 1
+
+        # CORR
+        if abs(corr_val) > corr_abs_max:
+            reasons.append(f"CORR>{corr_abs_max:.2f} ({corr_val:+.2f})")
+            self.stats["CORR"] += 1
+        else:
+            score += 1
+
+        # TREND bonus (UP/DOWN belirginse)
+        if t_val in {"UP","DOWN"} and abs_pct >= thr * 1.5:
+            score += 1
+        else:
+            reasons.append("TREND_WEAK")
+            self.stats["TREND_WEAK"] += 1
+
+        # PSYCH
+        psych = psych_weight(level_px, step=0.25, tol=0.0005)
+        score += psych
+
+        ok = (score >= min_score)
+        if ok:
+            self.stats_accepted += 1
+        else:
+            self.stats_total_scanned += 1
+        return ok, score, reasons, tc, psych
+
+    # -------------------------
+    # Tarama fonksiyonu
+    # -------------------------
     def scan_all_coins(self):
-        tf=self.settings["tf"]; uni=self.settings["universe"]
-        sp=self.settings["swing_period"]; ttl_h=self.settings["ttl_h"]; tol=self.settings["tol_pct"]
+        tf="5m"; uni=self.settings["universe"]
+        sp=self.settings["swing_period"]; ttl_h=self.settings["ttl_h"]; tol_atr=self.settings["tol_atr_mult"]
         save=self.settings["save_charts"]; out=self.settings["out_dir"]
+        vol_h=self.settings["vol_hours"]; corr_h_base=self.settings["corr_hours"]
+        vol_min_base=self.settings["vol_min"]; corr_abs_max_base=self.settings["corr_abs_max"]
+        thr=self.settings["trend_thr"]
+        min_score=self.settings["min_score"]
 
-        vol_h=self.settings["vol_hours"]; corr_h=self.settings["corr_hours"]
-        vol_min=self.settings["vol_min"]; corr_abs_max=self.settings["corr_abs_max"]
+        min_strength=self.settings["min_strength"]
+        min_relvol=self.settings["min_relvol"]
+        min_touches=self.settings["min_touches"]
+        min_bps=self.settings["min_bps"]
+        wick_ratio=self.settings["min_wick_ratio"]
 
-        trend_mode=self.settings["trend_mode"]  # "5h_struct" or "24h_change"
+        require_regime=self.settings["require_med_high"]
 
         btc_df = get_btc_df_cached(self.ex, tf, self.settings["limit"], drop_last=True, source="perp")
         vol_bars = bar_count_from_hours(tf, vol_h)
-        corr_bars = bar_count_from_hours(tf, corr_h)
 
         syms = list_usdtm_symbols(self.ex, topN=uni)
         self.window.write_event_value("LOG", f"🔍 {len(syms)} coin taranıyor...")
 
-        scanned=0; found=0
+        scanned=0
+        accepted_this_run = 0
         for s in syms:
             if self.stop_event.is_set(): return
             try:
                 scanned += 1
-                df = self._fetch_df(s)
-
-                # --- Vol & Corr filtreleri ---
-                vol_score = compute_vol_score(df, vol_bars)
-                corr_val  = compute_corr_with_btc(df, btc_df, corr_bars)
-                if vol_score < vol_min:             # Vol ≥
-                    continue
-                if abs(corr_val) > corr_abs_max:    # |Corr| ≤
+                df5 = self._fetch_df(s)
+                if len(df5) < max(220, vol_bars + 20):
                     continue
 
-                # --- Trend (HTF gate) ---
-                if trend_mode == "5h_struct":
-                    df1h = to_df(fetch_ohlcv_with_retry(self.ex, s, "1h", 60))
-                    trend_val = htf_trend_struct(df1h, lookback_hours=5, left=1, right=1, min_swing_pct=0.001)
-                else:
-                    trend_val = trend_from_24h(self.ex, s)
+                # trend/regime/strength/rv
+                t_val, pct = trend_change_8h_5m(df5, thr=thr)
+                abs_pct = abs(pct)
+                regime = volatility_regime(df5)
+                strength = trend_strength(df5)
+                rv = rel_volume(df5)
 
-                if trend_val == "UP":
-                    allowed_sides = {"SUP"}
-                elif trend_val == "DOWN":
-                    allowed_sides = {"RES"}
-                else:
-                    allowed_sides = {"SUP","RES"}  # SIDE
+                utc_hour = int(df5.index[-1].hour)
+                vol_min = self._maybe_adjust_volmin_by_session(vol_min_base, utc_hour)
 
-                # --- Sinyal (yalnızca 2. bar CANLI) ---
-                levels = detect_levels_minimal(df, tf=tf, swing_period=sp, tol_pct=tol, ttl_h=ttl_h)
-                if not levels:
+                corr_h, corr_abs_max = self._dynamic_corr_params(t_val, abs_pct)
+                corr_h = max(corr_h, corr_h_base)
+                corr_abs_max = min(max(corr_abs_max, 0.65), 0.90)
+                corr_val = compute_corr_with_btc(df5, btc_df, bar_count_from_hours(tf, corr_h))
+
+                vol_score = compute_vol_score_atr(df5, n=14, soft_cap=0.012)
+                if vol_score < vol_min: 
+                    self.stats["FAST_VOL_FILTER"] += 1
+                    continue
+                if abs(corr_val) > min(corr_abs_max, corr_abs_max_base):
+                    self.stats["FAST_CORR_FILTER"] += 1
                     continue
 
-                # SUP/RES — trend filtresine göre geçir
+                # SIDE: her iki taraf teorik olarak izinli; ama 2.touch + 1 mum ters yön şartı eklenecek
+                allowed_sides = {"SUP"} if t_val=="UP" else {"RES"} if t_val=="DOWN" else {"SUP","RES"}
+
+                levels = detect_levels_minimal(df5, tf=tf, swing_period=sp, tol_atr_mult=tol_atr, ttl_h=ttl_h)
+                if not levels: 
+                    self.stats["NO_LEVELS"] += 1
+                    continue
+
+                atr_now = _atr_series(df5, 14).iloc[-2]
+                close_prev = float(df5["close"].iloc[-2])
+                tol_price = (float(atr_now) if not math.isnan(atr_now) and atr_now>0 else close_prev*0.01) * float(tol_atr)
+
                 for side in ["SUP","RES"]:
-                    if side not in allowed_sides:
-                        continue
+                    if side not in allowed_sides: continue
                     cand=[lv for lv in levels if lv["side"]==side]
-                    if not cand:
-                        continue
+                    if not cand: continue
                     use_lv=cand[-1]
-                    chart = plot_chart(df.reset_index(), [use_lv], s, out, tf) if save else ""
+                    level_px = float(use_lv["price"])
+                    px_now = float(df5["close"].iloc[-1])
 
-                    row=[s, side, f"{use_lv['price']:.6f}",
-                         f"{vol_score:.2f}", f"{corr_val:+.2f}", trend_val, chart]
-                    self.window.write_event_value("SCAN_ROW", row)
-                    found += 1
+                    now_ts = df5.index[-1]
+                    if self._in_cooldown(s, side, now_ts):
+                        self.stats["COOLDOWN"] += 1
+                        continue
 
-                    if self.settings["telegram"]:
-                        send_telegram_alert(
-                            f"🔔 {s} | {side} {use_lv['price']:.6f}\n"
-                            f"Vol={vol_score:.2f}  Corr={corr_val:+.2f}  Trend(HTF-5h)={trend_val}"
+                    # ---- SIDE özel pre-check: 2. dokunuş + 1 mum ters yön zorunlu ----
+                    if t_val == "SIDE":
+                        if not side_second_touch_then_one_bar_opposite(df5, level_px, side, tol_price):
+                            if self.settings.get("debug_verbose", True):
+                                self.window.write_event_value("LOG", f"ℹ️ {s} {side} SIDE_2TOUCH_FAIL")
+                            self.stats["SIDE_2TOUCH_FAIL"] += 1
+                            continue
+
+                    # prepare ctx
+                    ctx = {
+                        "regime": regime, "abs_pct": abs_pct, "trend_thr": thr,
+                        "strength": strength, "rv": rv, "vol_score": vol_score,
+                        "corr_val": corr_val, "utc_hour": utc_hour, "tol_atr": tol_atr,
+                        "min_bps": min_bps, "wick_ratio": wick_ratio, "min_touches": min_touches,
+                        "require_regime": require_regime, "min_strength": min_strength,
+                        "min_relvol": min_relvol, "min_score": min_score,
+                        "vol_min": vol_min, "t_val": t_val, "corr_abs_max": min(corr_abs_max, corr_abs_max_base)
+                    }
+
+                    ok, score, reasons, tc, psych = self._evaluate_candidate(df5, s, side, use_lv, level_px, px_now, ctx)
+
+                    if not ok:
+                        if self.settings.get("debug_verbose", True):
+                            reason_str = ", ".join(reasons) if reasons else "N/A"
+                            self.window.write_event_value("LOG", f"❌ {s} {side} rejected (score={score}) reasons: {reason_str} (touches={tc}, psych={psych})")
+                        continue
+
+                    # PASSED
+                    accepted_this_run += 1
+                    chart = ""
+                    if self.settings["save_charts"]:
+                        try:
+                            chart = plot_chart(df5.reset_index(), levels, s, out_dir=self.settings["out_dir"], tf="5m")
+                        except Exception as e:
+                            self.window.write_event_value("LOG", f"⚠️ Chart oluşturulamadı: {s} {e}")
+
+                    t_disp = f"{t_val} ({pct*100:.1f}% / 8h)"
+                    row = [s, side, f"{level_px:.6f}", f"{vol_score:.2f}", f"{corr_val:+.2f}", t_disp, chart]
+                    payload = {"row": row, "levels": levels}
+                    self.window.write_event_value("SCAN_ROW", payload)
+
+                    if self.settings.get("telegram", False) and tg_enabled():
+                        msg = (
+                            f"📣 STRICT S/R — {s}\n"
+                            f"• Side: {side}\n"
+                            f"• Level: {level_px:.6f}\n"
+                            f"• Score: {score} (min {min_score})\n"
+                            f"• Regime: {regime} | Strength: {strength:.2f} | RelVol: {rv:.2f}\n"
+                            f"• Touches: {tc} | Psych:+{psych}\n"
+                            f"• Vol: {vol_score:.2f} | Corr: {corr_val:+.2f}\n"
+                            f"• Trend(8h@5m): {t_disp}"
                         )
+                        ok1 = send_telegram_message(msg)
+                        ok2 = True
+                        if chart:
+                            ok2 = send_telegram_photo(f"{s} — {side} @ {level_px:.6f}", chart)
+                        if ok1 and ok2:
+                            self.window.write_event_value("LOG", f"✈️ Telegram gönderildi: {s} {side}")
+                        else:
+                            self.window.write_event_value("LOG", f"⚠️ Telegram gönderimi başarısız: {s} {side}")
+
+                    self._mark_cooldown(s, side, now_ts)
+
+                if scanned % 50 == 0:
+                    self.window.write_event_value("LOG", f"📊 {scanned}/{len(syms)} tarandı — kabul edilen: {accepted_this_run}")
 
             except Exception as e:
                 self.window.write_event_value("LOG", f"{s}: {e}")
+                self.stats["EXCEPTIONS"] += 1
 
-            if scanned % 50 == 0:
-                self.window.write_event_value("LOG", f"📊 {scanned}/{len(syms)} tarandı | {found} listede")
+        self.stats["SCANNED"] += scanned
+        self.stats["ACCEPTED"] += accepted_this_run
+        if self.settings.get("enable_stats", True):
+            summary_lines = ["--- Tarama Özeti ---"]
+            summary_lines.append(f"Toplam taranan: {scanned}")
+            summary_lines.append(f"Bu tur kabul edilen: {accepted_this_run}")
+            summary_lines.append("En çok reddeden filtreler (top 12):")
+            for k, v in self.stats.most_common(12):
+                summary_lines.append(f"  {k}: {v}")
+            summary = "\n".join(summary_lines)
+            self.window.write_event_value("LOG", summary)
 
-        self.window.write_event_value("LOG", f"✅ Tamamlandı. {scanned} tarandı | {found} listede")
+        self.window.write_event_value("LOG", f"✅ Tarama tamamlandı. {scanned} tarandı, {accepted_this_run} kabul edildi.")
 
     def run(self):
         self.window.write_event_value("LOG","🚀 Tarama başladı...")
+        if not tg_enabled():
+            self.window.write_event_value("LOG","ℹ️ Telegram bilgileri eksik (TG_TOKEN/TG_CHAT_ID).")
         interval = self.settings["interval_s"]
         while not self.stop_event.is_set():
             t0 = time.time()
@@ -441,24 +768,80 @@ class ScannerWorker(threading.Thread):
                 time.sleep(0.1)
         self.window.write_event_value("LOG","⏸️ Tarama durduruldu.")
 
-# ====================== GUI ======================
+# =========================
+# Chart Window (Zoom)
+# =========================
+def show_chart_window(symbol: str, chart_path: str):
+    orig_png = read_bytes(chart_path)
+    scale = 1.0
+    header = [
+        sg.Text(symbol, font=("Arial", 12, "bold")), sg.Push(),
+        sg.Button("Zoom −", key="-ZMIN-"),
+        sg.Button("100%", key="-Z100-"),
+        sg.Button("Zoom +", key="-ZPLS-"),
+        sg.Button("Fit", key="-FIT-"),
+        sg.Button("Maximize", key="-MAX-"),
+        sg.Button("Open in Viewer", key="-OPEN-EXTERNAL-"),
+        sg.Button("Close")
+    ]
+    layout = [header, [sg.Column([[sg.Image(data=orig_png, key="-IM-PREVIEW-")]], scrollable=True, size=(980, 520), key="-SCROLL-")]] 
+    w = sg.Window(f"Chart — {os.path.basename(chart_path)}", layout, modal=False, finalize=True, resizable=True)
 
+    def update_scaled(new_scale: float):
+        nonlocal scale
+        scale = max(0.25, min(4.0, new_scale))
+        w["-IM-PREVIEW-"].update(data=scale_image_bytes(orig_png, scale))
+
+    while True:
+        e, _ = w.read()
+        if e in (sg.WIN_CLOSED, "Close"): break
+        if e == "-OPEN-EXTERNAL-": open_path(chart_path)
+        elif e == "-ZMIN-": update_scaled(scale * 0.85)
+        elif e == "-ZPLS-": update_scaled(scale * 1.15)
+        elif e == "-Z100-": update_scaled(1.0)
+        elif e == "-FIT-":
+            sc = w["-SCROLL-"].Widget
+            try:
+                max_w = sc.winfo_width(); max_h = sc.winfo_height()
+                if max_w > 50 and max_h > 50:
+                    w["-IM-PREVIEW-"].update(data=fit_to_window_bytes(orig_png, max_w, max_h))
+                else:
+                    update_scaled(1.0)
+            except Exception:
+                update_scaled(1.0)
+        elif e == "-MAX-":
+            try: w.maximize()
+            except Exception: pass
+    w.close()
+
+# =========================
+# GUI
+# =========================
 def make_window():
     sg.theme("DarkGrey13")
+    has_tg = tg_enabled()
     left=[
         [sg.Text("Universe"), sg.Input("500", key="-UNIV-", size=(6,1)),
-         sg.Text("TF"), sg.Combo(["5m","15m"], "5m", key="-TF-", readonly=True, size=(6,1)),
+         sg.Text("TF: 5m"), 
          sg.Text("Limit"), sg.Input("900", key="-LIM-", size=(6,1))],
         [sg.Text("Swing"), sg.Input("20", key="-SWING-", size=(6,1)),
          sg.Text("TTL(h)"), sg.Input("6", key="-TTL-", size=(6,1)),
-         sg.Text("Cluster tol %"), sg.Input("0.5", key="-TOL-", size=(7,1))],
+         sg.Text("Cluster tol(ATR×)"), sg.Input("0.5", key="-TOL_ATR-", size=(7,1))],
         [sg.Text("Vol ≥"), sg.Input("0.50", key="-VOL-", size=(6,1)),
-         sg.Text("|Corr| ≤"), sg.Input("0.70", key="-CORR-", size=(6,1)),
-         sg.Text("Trend Mode"),
-         sg.Combo(["5h Structure (HH/HL)", "24h Change %"],
-                  default_value="5h Structure (HH/HL)", key="-TMODE-", readonly=True, size=(20,1))],
+         sg.Text("|Corr| ≤ (base)"), sg.Input("0.70", key="-CORR-", size=(6,1)),
+         sg.Text("8h Δ% thr"), sg.Input("1.0", key="-THR-", size=(6,1))],
+        [sg.Text("Min Score"), sg.Input("4", key="-MSCORE-", size=(4,1)),
+         sg.Text("Cooldown(min)"), sg.Input("45", key="-COOLDN-", size=(4,1)),
+         sg.Checkbox("Rejim MED/HIGH şart", key="-REGOK-", default=True)],
+        [sg.Text("Strength ≥"), sg.Input("0.55", key="-STRMIN-", size=(6,1)),
+         sg.Text("RelVol ≥"), sg.Input("1.20", key="-RVMIN-", size=(6,1)),
+         sg.Text("Touches ≥"), sg.Input("2", key="-TCHMIN-", size=(4,1))],
+        [sg.Text("Min Dist (bps)"), sg.Input("3", key="-BPS-", size=(4,1)),
+         sg.Text("Wick min"), sg.Input("0.35", key="-WICK-", size=(5,1))],
         [sg.Checkbox("Save charts", key="-SAVE-", default=True),
-         sg.Checkbox("Telegram", key="-TG-", default=False)],
+         sg.Checkbox("Telegram", key="-TG-", default=has_tg, disabled=not has_tg)],
+        [sg.Checkbox("Verbose Debug (log each rejection)", key="-DEBUG-", default=True),
+         sg.Checkbox("Enable Stats", key="-STATS-", default=True)],
         [sg.Button("START SCAN (20s loop)", key="-START-", size=(22,2),
                    button_color=("white","#1e7e34"), font=("Arial", 12, "bold"))],
         [sg.Button("STOP", key="-STOP-", size=(22,1),
@@ -466,40 +849,56 @@ def make_window():
     ]
     right=[
         [sg.Table(values=[],
-                  headings=["Symbol","Side","Price","Vol","Corr","Trend(HTF)","Chart"],
-                  key="-RES-", num_rows=24, expand_x=True, expand_y=True,
-                  enable_events=True, auto_size_columns=True)],
+                  headings=["Symbol","Side","Price","Vol","Corr","Trend(8h@5m)","Chart"],
+                  key="-RES-", num_rows=22, expand_x=True, expand_y=True,
+                  enable_events=True, auto_size_columns=True, justification="left")],
         [sg.Button("Open Chart (selected)", key="-OPEN-")],
         [sg.Multiline(size=(100,8), key="-LOG-", autoscroll=True, disabled=True)]
     ]
     layout=[[sg.Column(left, vertical_alignment="top"),
              sg.VSeparator(),
              sg.Column(right, expand_x=True, expand_y=True)]]
-    return sg.Window("META", layout, finalize=True, resizable=True)
+    return sg.Window("DIGO", layout, finalize=True, resizable=True)
 
 def read_settings(v):
-    tmode = _get(v, "-TMODE-", "5h Structure (HH/HL)")
-    trend_mode = "5h_struct" if "5h" in tmode else "24h_change"
     return dict(
-        tf=_get(v, "-TF-", "5m"),
+        tf="5m",
         limit=_parse_int(v, "-LIM-", 900),
         universe=_parse_int(v, "-UNIV-", 500),
         swing_period=_parse_int(v, "-SWING-", 20),
         ttl_h=_parse_int(v, "-TTL-", 6),
-        tol_pct=_parse_float(v, "-TOL-", 0.5),
+        tol_atr_mult=_parse_float(v, "-TOL_ATR-", 0.5),
         vol_hours=24,
         corr_hours=12,
         vol_min=_parse_float(v, "-VOL-", 0.50),
         corr_abs_max=_parse_float(v, "-CORR-", 0.70),
+        trend_thr=_parse_float(v, "-THR-", 1.0) / 100.0,
         save_charts=bool(_get(v, "-SAVE-", True)),
-        telegram=bool(_get(v, "-TG-", False)),
+        telegram=bool(_get(v, "-TG-", False)) and tg_enabled(),
         out_dir="sr_charts",
         interval_s=20,
-        trend_mode=trend_mode,
+        min_score=_parse_int(v, "-MSCORE-", 4),
+        cooldown_min=_parse_float(v, "-COOLDN-", 45.0),
+        require_med_high=bool(_get(v, "-REGOK-", True)),
+        min_strength=_parse_float(v, "-STRMIN-", 0.55),
+        min_relvol=_parse_float(v, "-RVMIN-", 1.20),
+        min_touches=_parse_int(v, "-TCHMIN-", 2),
+        min_bps=_parse_float(v, "-BPS-", 3.0),
+        min_wick_ratio=_parse_float(v, "-WICK-", 0.35),
+        debug_verbose=bool(_get(v, "-DEBUG-", True)),
+        enable_stats=bool(_get(v, "-STATS-", True)),
     )
 
+# =========================
+# Global cache
+# =========================
+LEVEL_CACHE = {}
+
+# =========================
+# Main loop / Events
+# =========================
 def main():
-    win=make_window(); worker=None; rows=[]
+    win=make_window(); worker=None; rows=[]; last_settings=None
     def log(msg): win["-LOG-"].update(value=win["-LOG-"].get()+msg+"\n")
 
     while True:
@@ -510,12 +909,16 @@ def main():
 
         if e=="-START-":
             if worker: worker.request_stop(); worker=None
-            st=read_settings(v)
+            st=read_settings(v); last_settings=st
             worker=ScannerWorker(win,st)
             rows=[]; win["-RES-"].update(values=rows)
             worker.start()
-            tlabel = "5h Structure (HH/HL)" if st["trend_mode"]=="5h_struct" else "24h Change %"
-            log(f"🚀 Başladı — 0.70% + 1T kapalı + 2T CANLI. Filtre: Vol ≥, |Corr| ≤, Trend Mode: {tlabel}")
+            log("🚀 Başladı — Debug & Stats mod aktif.")
+            log(f"✳️ Debug verbose: {st['debug_verbose']} | Stats: {st['enable_stats']}")
+            if st["telegram"]:
+                log("✈️ Telegram gönderimi: AÇIK")
+            else:
+                log("✈️ Telegram gönderimi: KAPALI")
 
         elif e=="-STOP-":
             if worker: worker.request_stop(); worker=None
@@ -523,22 +926,50 @@ def main():
 
         elif e=="-OPEN-":
             sel=v["-RES-"]
-            if sel and rows:
-                chart=rows[sel[0]][6]
-                if chart and os.path.exists(chart): open_path(chart)
+            if not (sel and rows):
+                log("ℹ️ Tablo satırı seçmedin."); continue
+            row = rows[sel[0]]
+            symbol, side, _, _, _, _, chart_path = row
+            st = last_settings or read_settings(v)
+            tf = "5m"; limit = st["limit"]; sp=st["swing_period"]; tol_atr=st["tol_atr_mult"]; ttl_h=st["ttl_h"]
+            ex = worker.ex if worker else load_exchange()
 
-        elif e=="-SCAN_ROW":
-            pass  # not used
+            try:
+                if chart_path and os.path.exists(chart_path):
+                    show_chart_window(symbol, chart_path); continue
+
+                df = to_df(fetch_ohlcv_with_retry(ex, symbol, tf, limit))
+                new_levels = detect_levels_minimal(df, tf=tf, swing_period=sp, tol_atr_mult=tol_atr, ttl_h=ttl_h)
+
+                if new_levels:
+                    chart_path = plot_chart(df.reset_index(), new_levels, symbol, out_dir=st["out_dir"], tf=tf)
+                    rows[sel[0]][6] = chart_path; win["-RES-"].update(values=rows)
+                    show_chart_window(symbol, chart_path); continue
+
+                cached = LEVEL_CACHE.get((symbol, side))
+                if cached:
+                    chart_path = plot_chart(df.reset_index(), cached, symbol, out_dir=st["out_dir"], tf=tf)
+                    rows[sel[0]][6] = chart_path; win["-RES-"].update(values=rows)
+                    log(f"ℹ️ {symbol}: 2. mum CANLI yok; cache ile çizildi.")
+                    show_chart_window(symbol, chart_path); continue
+
+                chart_path = plot_price_only(df.reset_index(), symbol, out_dir=st["out_dir"], tf=tf)
+                rows[sel[0]][6] = chart_path; win["-RES-"].update(values=rows)
+                log(f"ℹ️ {symbol}: Aktif SUP/RES yok; sadece fiyat.")
+                show_chart_window(symbol, chart_path)
+
+            except Exception as ex:
+                log(f"❌ Grafik açılamadı: {ex}")
 
         elif e=="SCAN_ROW":
-            row=v[e]
-            # aynı sembol & side varsa güncelle
+            payload = v[e]; row = payload["row"]; levels = payload.get("levels", [])
             replaced=False
             for idx,r in enumerate(rows):
                 if r[0]==row[0] and r[1]==row[1]:
                     rows[idx]=row; replaced=True; break
             if not replaced: rows.append(row)
             win["-RES-"].update(values=rows); win.refresh()
+            if levels: LEVEL_CACHE[(row[0], row[1])] = levels
 
         elif e=="LOG":
             log(v[e])
@@ -547,4 +978,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# gold file
